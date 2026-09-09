@@ -1,5 +1,6 @@
 import os
 import tempfile
+import subprocess
 
 import cv2
 import numpy as np
@@ -1934,6 +1935,46 @@ if uploaded_file is not None:
     out_overlay.release()
     out_skeleton.release()
 
+    # OpenCVのmp4v出力はブラウザ（特にSafari）で再生できないことがあるため、
+    # ffmpegでH.264 + yuv420pへ変換する。Dockerfileでffmpegを導入済み。
+    overlay_h264_path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix="_h264.mp4"
+    ).name
+
+    skeleton_h264_path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix="_h264.mp4"
+    ).name
+
+    for src_path, dst_path in [
+        (out_overlay_path, overlay_h264_path),
+        (out_skeleton_path, skeleton_h264_path),
+    ]:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error",
+                "-i", src_path,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                dst_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            st.error(
+                "H.264動画への変換に失敗しました。\n\n"
+                + (result.stderr or "原因不明")
+            )
+            st.stop()
+
 
     # =====================================================
     # Metrics UI
@@ -2059,7 +2100,7 @@ if uploaded_file is not None:
         )
 
         st.video(
-            out_overlay_path
+            overlay_h264_path
         )
 
 
@@ -2070,7 +2111,7 @@ if uploaded_file is not None:
         )
 
         st.video(
-            out_skeleton_path
+            skeleton_h264_path
         )
 
 
