@@ -1509,56 +1509,33 @@ if uploaded_file is not None:
     # Video Output
     # =====================================================
 
-    overlay_file = tempfile.NamedTemporaryFile(
+    # Renderはメモリ節約のため1本だけ生成する。
+    # 1920x1080の元動画は最大1280px幅へ縮小して描画し、
+    # OpenCVの中間MP4を作らず、ffmpegへ直接H.264として流す。
+    max_render_width = 1280
+
+    render_scale = min(
+        1.0,
+        max_render_width / max(width, 1)
+    )
+
+    render_width = max(
+        2,
+        int(round(width * render_scale))
+    )
+
+    render_height = max(
+        2,
+        int(round(height * render_scale))
+    )
+
+    sx = render_width / max(width, 1)
+    sy = render_height / max(height, 1)
+
+    overlay_h264_path = tempfile.NamedTemporaryFile(
         delete=False,
-        suffix=".mp4"
-    )
-
-    overlay_file.close()
-
-
-    skeleton_file = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp4"
-    )
-
-    skeleton_file.close()
-
-
-    out_overlay_path = (
-        overlay_file.name
-    )
-
-    out_skeleton_path = (
-        skeleton_file.name
-    )
-
-
-    fourcc = cv2.VideoWriter_fourcc(
-        *"mp4v"
-    )
-
-
-    out_overlay = cv2.VideoWriter(
-        out_overlay_path,
-        fourcc,
-        orig_fps,
-        (width, height)
-    )
-
-
-    out_skeleton = cv2.VideoWriter(
-        out_skeleton_path,
-        fourcc,
-        orig_fps,
-        (width, height)
-    )
-
-    if not out_overlay.isOpened() or not out_skeleton.isOpened():
-        st.error(
-            "解析動画の出力先を開けませんでした。"
-        )
-        st.stop()
+        suffix="_analysis_h264.mp4"
+    ).name
 
 
     st.subheader(
@@ -1571,409 +1548,420 @@ if uploaded_file is not None:
     )
 
 
+    # メモリ回収。1パス目のMediaPipe一時領域を
+    # 2パス目に持ち越さないようにする。
+    import gc
+    gc.collect()
+
+
     # 2パス目: 元動画を再読込して描画
     render_cap = cv2.VideoCapture(
         input_file.name
     )
 
+    if not render_cap.isOpened():
+
+        st.error(
+            "解析動画の入力を再度開けませんでした。"
+        )
+        st.stop()
+
+
+    # ffmpegへraw BGRフレームを直接渡す。
+    # 中間mp4と2本目の動画を作らないことでメモリピークを抑える。
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{render_width}x{render_height}",
+        "-r", f"{orig_fps:.6f}",
+        "-i", "-",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "25",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        overlay_h264_path,
+    ]
+
+    ffmpeg_process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+
     wrist_trail = []
 
-    # 軌道描画を直近100フレームに制限し、O(n^2)の増大を防ぐ
-    MAX_TRAIL = 100
+    # 軌道描画を直近60フレームに制限。
+    MAX_TRAIL = 60
 
     i = 0
 
-    while render_cap.isOpened():
+    try:
 
-        ret, frame = render_cap.read()
+        while render_cap.isOpened():
 
-        if not ret:
-            break
+            ret, frame = render_cap.read()
 
-        draw_frame = frame.copy()
+            if not ret:
+                break
 
-        black_frame = np.zeros_like(
-            frame
-        )
+            if i >= num_frames:
+                break
 
+            # 1280px幅を上限に縮小して描画。
+            if render_scale < 0.999999:
 
-        # -------------------------------------------------
-        # Points
-        # -------------------------------------------------
+                draw_frame = cv2.resize(
+                    frame,
+                    (render_width, render_height),
+                    interpolation=cv2.INTER_AREA
+                )
 
-        pelvis_pt = safe_point(
-            pelvis_centers[i]
-        )
+            else:
 
-        thorax_pt = safe_point(
-            thorax_centers[i]
-        )
-
-        shoulder_pt = safe_point(
-            throwing_shoulders[i]
-        )
-
-        elbow_pt = safe_point(
-            throwing_elbows[i]
-        )
-
-        wrist_pt = safe_point(
-            throwing_wrists[i]
-        )
-
-        pivot_pt = safe_point(
-            pivot_ankles[i]
-        )
-
-        lead_pt = safe_point(
-            lead_ankles[i]
-        )
+                draw_frame = frame
 
 
-        # -------------------------------------------------
-        # Pelvis
-        # -------------------------------------------------
+            def render_point(p):
 
-        cv2.circle(
-            draw_frame,
-            pelvis_pt,
-            10,
-            (255, 0, 0),
-            -1
-        )
-
-        cv2.circle(
-            black_frame,
-            pelvis_pt,
-            10,
-            (255, 0, 0),
-            -1
-        )
+                return (
+                    int(round(p[0] * sx)),
+                    int(round(p[1] * sy))
+                )
 
 
-        # -------------------------------------------------
-        # Thorax
-        # -------------------------------------------------
+            # -------------------------------------------------
+            # Points
+            # -------------------------------------------------
 
-        cv2.circle(
-            draw_frame,
-            thorax_pt,
-            10,
-            (0, 255, 0),
-            -1
-        )
-
-        cv2.circle(
-            black_frame,
-            thorax_pt,
-            10,
-            (0, 255, 0),
-            -1
-        )
-
-
-        # -------------------------------------------------
-        # Throwing Arm
-        # -------------------------------------------------
-
-        cv2.line(
-            draw_frame,
-            shoulder_pt,
-            elbow_pt,
-            (0, 255, 255),
-            4
-        )
-
-        cv2.line(
-            draw_frame,
-            elbow_pt,
-            wrist_pt,
-            (0, 255, 255),
-            4
-        )
-
-
-        cv2.line(
-            black_frame,
-            shoulder_pt,
-            elbow_pt,
-            (0, 255, 255),
-            4
-        )
-
-        cv2.line(
-            black_frame,
-            elbow_pt,
-            wrist_pt,
-            (0, 255, 255),
-            4
-        )
-
-
-        # -------------------------------------------------
-        # Feet
-        # -------------------------------------------------
-
-        cv2.circle(
-            draw_frame,
-            pivot_pt,
-            7,
-            (255, 255, 0),
-            -1
-        )
-
-        cv2.circle(
-            draw_frame,
-            lead_pt,
-            7,
-            (255, 255, 0),
-            -1
-        )
-
-
-        # -------------------------------------------------
-        # Wrist Trail
-        # -------------------------------------------------
-
-        if show_wrist_trail:
-
-            wrist_trail.append(
-                wrist_pt
+            pelvis_pt = render_point(
+                pelvis_centers[i]
             )
 
-            if len(wrist_trail) > MAX_TRAIL:
-                wrist_trail.pop(0)
+            thorax_pt = render_point(
+                thorax_centers[i]
+            )
 
-            for k in range(
-                1,
-                len(wrist_trail)
-            ):
+            shoulder_pt = render_point(
+                throwing_shoulders[i]
+            )
+
+            elbow_pt = render_point(
+                throwing_elbows[i]
+            )
+
+            wrist_pt = render_point(
+                throwing_wrists[i]
+            )
+
+            pivot_pt = render_point(
+                pivot_ankles[i]
+            )
+
+            lead_pt = render_point(
+                lead_ankles[i]
+            )
+
+
+            # -------------------------------------------------
+            # Pelvis
+            # -------------------------------------------------
+
+            cv2.circle(
+                draw_frame,
+                pelvis_pt,
+                max(5, int(round(10 * render_scale))),
+                (255, 0, 0),
+                -1
+            )
+
+
+            # -------------------------------------------------
+            # Thorax
+            # -------------------------------------------------
+
+            cv2.circle(
+                draw_frame,
+                thorax_pt,
+                max(5, int(round(10 * render_scale))),
+                (0, 255, 0),
+                -1
+            )
+
+
+            # -------------------------------------------------
+            # Throwing Arm
+            # -------------------------------------------------
+
+            arm_thickness = max(
+                2,
+                int(round(4 * render_scale))
+            )
+
+            cv2.line(
+                draw_frame,
+                shoulder_pt,
+                elbow_pt,
+                (0, 255, 255),
+                arm_thickness
+            )
+
+            cv2.line(
+                draw_frame,
+                elbow_pt,
+                wrist_pt,
+                (0, 255, 255),
+                arm_thickness
+            )
+
+
+            # -------------------------------------------------
+            # Feet
+            # -------------------------------------------------
+
+            cv2.circle(
+                draw_frame,
+                pivot_pt,
+                max(4, int(round(7 * render_scale))),
+                (255, 255, 0),
+                -1
+            )
+
+            cv2.circle(
+                draw_frame,
+                lead_pt,
+                max(4, int(round(7 * render_scale))),
+                (255, 255, 0),
+                -1
+            )
+
+
+            # -------------------------------------------------
+            # Wrist Trail
+            # -------------------------------------------------
+
+            if show_wrist_trail:
+
+                wrist_trail.append(
+                    wrist_pt
+                )
+
+                if len(wrist_trail) > MAX_TRAIL:
+                    wrist_trail.pop(0)
+
+                trail_thickness = max(
+                    2,
+                    int(round(3 * render_scale))
+                )
+
+                for k in range(
+                    1,
+                    len(wrist_trail)
+                ):
+
+                    cv2.line(
+                        draw_frame,
+                        wrist_trail[k - 1],
+                        wrist_trail[k],
+                        (0, 0, 255),
+                        trail_thickness
+                    )
+
+
+            # -------------------------------------------------
+            # Pelvis Trail
+            # -------------------------------------------------
+
+            if i > 0:
+
+                prev_pelvis = render_point(
+                    pelvis_centers[i - 1]
+                )
 
                 cv2.line(
                     draw_frame,
-                    wrist_trail[k - 1],
-                    wrist_trail[k],
-                    (0, 0, 255),
-                    3
+                    prev_pelvis,
+                    pelvis_pt,
+                    (255, 0, 0),
+                    max(2, int(round(3 * render_scale)))
                 )
+
+
+            # -------------------------------------------------
+            # Foot Plant
+            # -------------------------------------------------
+
+            if i == foot_plant_idx:
 
                 cv2.line(
-                    black_frame,
-                    wrist_trail[k - 1],
-                    wrist_trail[k],
-                    (0, 0, 255),
-                    3
+                    draw_frame,
+                    pivot_pt,
+                    lead_pt,
+                    (255, 0, 255),
+                    max(3, int(round(5 * render_scale)))
+                )
+
+                cv2.putText(
+                    draw_frame,
+                    "FOOT PLANT",
+                    (
+                        lead_pt[0] + max(5, int(round(10 * render_scale))),
+                        max(20, lead_pt[1] - max(10, int(round(20 * render_scale))))
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.4, 0.7 * render_scale),
+                    (255, 0, 255),
+                    max(1, int(round(2 * render_scale)))
                 )
 
 
-        # -------------------------------------------------
-        # Pelvis Trail
-        # -------------------------------------------------
+            # -------------------------------------------------
+            # MER
+            # -------------------------------------------------
 
-        if i > 0:
+            if i == mer_idx:
 
-            prev_pelvis = safe_point(
-                pelvis_centers[i - 1]
-            )
-
-            cv2.line(
-                draw_frame,
-                prev_pelvis,
-                pelvis_pt,
-                (255, 0, 0),
-                3
-            )
-
-            cv2.line(
-                black_frame,
-                prev_pelvis,
-                pelvis_pt,
-                (255, 0, 0),
-                3
-            )
-
-
-        # -------------------------------------------------
-        # Foot Plant
-        # -------------------------------------------------
-
-        if i == foot_plant_idx:
-
-            cv2.line(
-                draw_frame,
-                pivot_pt,
-                lead_pt,
-                (255, 0, 255),
-                5
-            )
-
-            cv2.putText(
-                draw_frame,
-                "FOOT PLANT",
-                (
-                    lead_pt[0] + 10,
-                    lead_pt[1] - 20
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 0, 255),
-                2
-            )
-
-
-        # -------------------------------------------------
-        # MER
-        # -------------------------------------------------
-
-        if i == mer_idx:
-
-            cv2.putText(
-                draw_frame,
-                "MER",
-                (
-                    wrist_pt[0] + 10,
-                    wrist_pt[1] - 10
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2
-            )
-
-
-        # -------------------------------------------------
-        # Release
-        # -------------------------------------------------
-
-        if i == release_idx:
-
-            cv2.putText(
-                draw_frame,
-                "RELEASE",
-                (
-                    wrist_pt[0] + 10,
-                    wrist_pt[1] + 25
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2
-            )
-
-
-        # -------------------------------------------------
-        # Info
-        # -------------------------------------------------
-
-        info = [
-
-            f"Time: {times[i]:.3f}s",
-
-            f"Pelvis Vel: "
-            f"{pelvis_velocity[i]:.2f} m/s",
-
-            f"Thorax Vel: "
-            f"{thorax_velocity[i]:.2f} m/s",
-
-            f"Pelvis Rot: "
-            f"{pelvis_rotation_velocity[i]:.0f} deg/s",
-
-            f"Thorax Rot: "
-            f"{thorax_rotation_velocity[i]:.0f} deg/s",
-
-            f"Wrist Speed: "
-            f"{wrist_speed[i]:.2f} m/s",
-
-            f"Pseudo GRF: "
-            f"{pseudo_grf[i]:.0f} N"
-
-        ]
-
-
-        for j, text in enumerate(
-            info
-        ):
-
-            cv2.putText(
-                draw_frame,
-                text,
-                (
-                    30,
-                    35 + j * 28
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (255, 255, 255),
-                2
-            )
-
-
-        out_overlay.write(
-            draw_frame
-        )
-
-        out_skeleton.write(
-            black_frame
-        )
-
-
-        if i % 5 == 0:
-
-            video_progress.progress(
-                min(
-                    (i + 1) /
-                    max(num_frames, 1),
-                    1.0
+                cv2.putText(
+                    draw_frame,
+                    "MER",
+                    (
+                        wrist_pt[0] + max(5, int(round(10 * render_scale))),
+                        max(20, wrist_pt[1] - max(5, int(round(10 * render_scale))))
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.45, 0.8 * render_scale),
+                    (0, 255, 255),
+                    max(1, int(round(2 * render_scale)))
                 )
+
+
+            # -------------------------------------------------
+            # Release
+            # -------------------------------------------------
+
+            if i == release_idx:
+
+                cv2.putText(
+                    draw_frame,
+                    "RELEASE",
+                    (
+                        wrist_pt[0] + max(5, int(round(10 * render_scale))),
+                        wrist_pt[1] + max(10, int(round(25 * render_scale)))
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.45, 0.8 * render_scale),
+                    (0, 255, 0),
+                    max(1, int(round(2 * render_scale)))
+                )
+
+
+            # -------------------------------------------------
+            # Info
+            # -------------------------------------------------
+
+            info = [
+                f"Time: {times[i]:.3f}s",
+                f"Pelvis Vel: {pelvis_velocity[i]:.2f} m/s",
+                f"Thorax Vel: {thorax_velocity[i]:.2f} m/s",
+                f"Pelvis Rot: {pelvis_rotation_velocity[i]:.0f} deg/s",
+                f"Thorax Rot: {thorax_rotation_velocity[i]:.0f} deg/s",
+                f"Wrist Speed: {wrist_speed[i]:.2f} m/s",
+                f"Pseudo GRF: {pseudo_grf[i]:.0f} N"
+            ]
+
+
+            font_scale = max(
+                0.38,
+                0.62 * render_scale
             )
 
-        i += 1
+            text_thickness = max(
+                1,
+                int(round(2 * render_scale))
+            )
+
+            for j, text in enumerate(info):
+
+                cv2.putText(
+                    draw_frame,
+                    text,
+                    (
+                        max(10, int(round(30 * render_scale))),
+                        max(20, int(round((35 + j * 28) * render_scale)))
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (255, 255, 255),
+                    text_thickness
+                )
 
 
-    render_cap.release()
+            if ffmpeg_process.stdin is not None:
+                ffmpeg_process.stdin.write(
+                    memoryview(draw_frame).cast("B")
+                )
 
-    out_overlay.release()
-    out_skeleton.release()
 
-    # OpenCVのmp4v出力はブラウザ（特にSafari）で再生できないことがあるため、
-    # ffmpegでH.264 + yuv420pへ変換する。Dockerfileでffmpegを導入済み。
-    overlay_h264_path = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix="_h264.mp4"
-    ).name
+            if i % 10 == 0:
 
-    skeleton_h264_path = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix="_h264.mp4"
-    ).name
+                video_progress.progress(
+                    min(
+                        (i + 1) /
+                        max(num_frames, 1),
+                        1.0
+                    )
+                )
 
-    for src_path, dst_path in [
-        (out_overlay_path, overlay_h264_path),
-        (out_skeleton_path, skeleton_h264_path),
-    ]:
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel", "error",
-                "-i", src_path,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                dst_path,
-            ],
-            capture_output=True,
-            text=True,
+            i += 1
+
+
+    except BrokenPipeError:
+
+        st.error(
+            "解析動画のエンコード中にffmpegが終了しました。"
+        )
+        st.stop()
+
+    finally:
+
+        render_cap.release()
+
+        if ffmpeg_process.stdin is not None:
+            try:
+                ffmpeg_process.stdin.close()
+            except Exception:
+                pass
+
+
+    _, ffmpeg_stderr = ffmpeg_process.communicate()
+    return_code = ffmpeg_process.returncode
+
+
+    if return_code != 0:
+
+        stderr_text = (
+            ffmpeg_stderr.decode("utf-8", errors="replace")
+            if isinstance(ffmpeg_stderr, bytes)
+            else str(ffmpeg_stderr)
         )
 
-        if result.returncode != 0:
-            st.error(
-                "H.264動画への変換に失敗しました。\n\n"
-                + (result.stderr or "原因不明")
-            )
-            st.stop()
+        st.error(
+            "解析動画のH.264エンコードに失敗しました。\n\n"
+            + (stderr_text or "原因不明")
+        )
+        st.stop()
+
+
+    video_progress.progress(
+        1.0
+    )
 
 
     # =====================================================
@@ -2090,29 +2078,17 @@ if uploaded_file is not None:
     # Videos
     # =====================================================
 
-    col1, col2 = st.columns(2)
+    st.subheader(
+        "📹 実動画 + 解析"
+    )
 
+    st.video(
+        overlay_h264_path
+    )
 
-    with col1:
-
-        st.subheader(
-            "📹 実動画 + 解析"
-        )
-
-        st.video(
-            overlay_h264_path
-        )
-
-
-    with col2:
-
-        st.subheader(
-            "🦴 軌道・骨格"
-        )
-
-        st.video(
-            skeleton_h264_path
-        )
+    st.caption(
+        "Renderのメモリ節約のため、解析動画は最大1280px幅・H.264で1本のみ生成しています。"
+    )
 
 
     # =====================================================
