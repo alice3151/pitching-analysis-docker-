@@ -1929,25 +1929,32 @@ if uploaded_file is not None:
         )
         st.stop()
 
+        except BrokenPipeError:
+
+        st.error(
+            "解析動画のエンコード中にffmpegが終了しました。"
+        )
+        st.stop()
+
     finally:
 
-    render_cap.release()
+        render_cap.release()
 
-    if ffmpeg_process.stdin is not None:
-        try:
-            ffmpeg_process.stdin.close()
-        except Exception:
-            pass
+        if ffmpeg_process.stdin is not None:
+            try:
+                ffmpeg_process.stdin.close()
+            except Exception:
+                pass
 
 
-# stdinはすでにcloseしているため、
-# communicate()は使わずwait()でffmpegの終了を待つ。
-return_code = ffmpeg_process.wait()
+    # stdinはすでにcloseしているため、
+    # communicate()は使わずwait()でffmpegの終了を待つ。
+    return_code = ffmpeg_process.wait()
 
-if ffmpeg_process.stderr is not None:
-    ffmpeg_stderr = ffmpeg_process.stderr.read()
-else:
-    ffmpeg_stderr = b""
+    if ffmpeg_process.stderr is not None:
+        ffmpeg_stderr = ffmpeg_process.stderr.read()
+    else:
+        ffmpeg_stderr = b""
 
 
     if return_code != 0:
@@ -1959,7 +1966,7 @@ else:
         )
 
         st.error(
-            "解析動画のH.264エンコードに失敗しました。\n\n"
+            "解析動画のH.264エンコードに失敗しました.\n\n"
             + (stderr_text or "原因不明")
         )
         st.stop()
