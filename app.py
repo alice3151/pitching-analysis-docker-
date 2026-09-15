@@ -1931,17 +1931,23 @@ if uploaded_file is not None:
 
     finally:
 
-        render_cap.release()
+    render_cap.release()
 
-        if ffmpeg_process.stdin is not None:
-            try:
-                ffmpeg_process.stdin.close()
-            except Exception:
-                pass
+    if ffmpeg_process.stdin is not None:
+        try:
+            ffmpeg_process.stdin.close()
+        except Exception:
+            pass
 
 
-    _, ffmpeg_stderr = ffmpeg_process.communicate()
-    return_code = ffmpeg_process.returncode
+# stdinはすでにcloseしているため、
+# communicate()は使わずwait()でffmpegの終了を待つ。
+return_code = ffmpeg_process.wait()
+
+if ffmpeg_process.stderr is not None:
+    ffmpeg_stderr = ffmpeg_process.stderr.read()
+else:
+    ffmpeg_stderr = b""
 
 
     if return_code != 0:
