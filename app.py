@@ -1929,13 +1929,6 @@ if uploaded_file is not None:
         )
         st.stop()
 
-        except BrokenPipeError:
-
-        st.error(
-            "解析動画のエンコード中にffmpegが終了しました。"
-        )
-        st.stop()
-
     finally:
 
         render_cap.release()
@@ -1947,14 +1940,15 @@ if uploaded_file is not None:
                 pass
 
 
-    # stdinはすでにcloseしているため、
-    # communicate()は使わずwait()でffmpegの終了を待つ。
+    # stdin is already closed above, so do not call communicate():
+    # communicate() may try to flush the closed stdin and raise
+    # ValueError: flush of closed file.
     return_code = ffmpeg_process.wait()
-
-    if ffmpeg_process.stderr is not None:
-        ffmpeg_stderr = ffmpeg_process.stderr.read()
-    else:
-        ffmpeg_stderr = b""
+    ffmpeg_stderr = (
+        ffmpeg_process.stderr.read()
+        if ffmpeg_process.stderr is not None
+        else b""
+    )
 
 
     if return_code != 0:
@@ -1966,7 +1960,7 @@ if uploaded_file is not None:
         )
 
         st.error(
-            "解析動画のH.264エンコードに失敗しました.\n\n"
+            "解析動画のH.264エンコードに失敗しました。\n\n"
             + (stderr_text or "原因不明")
         )
         st.stop()
