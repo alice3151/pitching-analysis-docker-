@@ -268,45 +268,449 @@ def calculate_elbow_angle(
 
 
 def find_foot_plant(
-    lead_ankles
+    lead_ankles,
+    fps=30.0
 ):
 
     """
-    簡易Foot Plant推定。
+    2D動画からの簡易Foot Plant推定。
 
-    前足が下方向へ移動した後、
-    Y座標が最大に近づく位置を候補とする。
+    前足足首のY座標が下方向へ移動したあと、
+    接地してY方向の速度が小さくなる最初の安定候補を探す。
 
-    ※動画だけから完全なFCを保証するものではない。
+    完全なFC検出ではないため、必ず実動画で確認する。
     """
 
-    y = lead_ankles[:, 1]
+    points = np.asarray(
+        lead_ankles,
+        dtype=float
+    )
 
-    n = len(y)
+    n = len(points)
 
     if n < 10:
+        return max(0, n // 2)
 
-        return n // 2
-
-    start = int(
-        n * 0.15
+    y = moving_average(
+        points[:, 1],
+        window=5
     )
 
-    end = int(
-        n * 0.85
+    dt_local = 1.0 / max(float(fps), 1.0)
+
+    vy = np.gradient(
+        y,
+        dt_local
     )
 
-    candidate = y[
-        start:end
-    ]
+    # まず「前足が最も強く下方向へ動いた」位置を求める。
+    start = max(
+        2,
+        int(n * 0.10)
+    )
 
-    return (
-        start +
-        int(
+    search_end = min(
+        n - 5,
+        int(n * 0.80)
+    )
+
+    if search_end <= start:
+        return int(np.nanargmax(y))
+
+    downward_v = vy[start:search_end]
+
+    if not np.any(
+        np.isfinite(downward_v)
+    ):
+        return int(np.nanargmax(y))
+
+    fastest_down_idx = (
+        start
+        + int(
             np.nanargmax(
-                candidate
+                downward_v
             )
         )
+    )
+
+    # そこから先、Y方向速度が小さくなって
+    # 数フレーム安定する候補を探す。
+    settle_frames = max(
+        2,
+        int(round(0.10 * fps))
+    )
+
+    candidate_end = min(
+        n - settle_frames - 1,
+        fastest_down_idx
+        + max(
+            settle_frames * 4,
+            int(round(0.40 * fps))
+        )
+    )
+
+    y_range = np.nanmax(
+        y[
+            fastest_down_idx:
+            candidate_end + 1
+        ]
+    ) - np.nanmin(
+        y[
+            fastest_down_idx:
+            candidate_end + 1
+        ]
+    )
+
+    # 画面ノイズに依存しすぎないための許容値。
+    stable_v_threshold = max(
+        20.0,
+        abs(
+            np.nanpercentile(
+                vy[
+                    start:
+                    search_end
+                ],
+                25
+            )
+        ) * 0.35
+    )
+
+    best_idx = fastest_down_idx
+    best_score = -np.inf
+
+    for i in range(
+        fastest_down_idx,
+        candidate_end + 1
+    ):
+
+        j2 = min(
+            n,
+            i + settle_frames
+        )
+
+        if j2 <= i + 1:
+            continue
+
+        local_v = np.abs(
+            vy[i:j2]
+        )
+
+        valid = local_v[
+            np.isfinite(local_v)
+        ]
+
+        if len(valid) == 0:
+            continue
+
+        stable_ratio = float(
+            np.mean(
+                valid
+                <= stable_v_threshold
+            )
+        )
+
+        # 「下に十分進んでいる」ことも評価。
+        y_progress = (
+            y[i] -
+            y[fastest_down_idx]
+        )
+
+        # 早すぎる候補は軽くペナルティ。
+        score = (
+            2.0 * stable_ratio
+            + 1.0 * (
+                y_progress
+                /
+                max(
+                    y_range,
+                    1.0
+                )
+            )
+            - 0.15 * (
+                (i - fastest_down_idx)
+                /
+                max(
+                    fps * 0.5,
+                    1.0
+                )
+            )
+        )
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    # もし安定候補が見つからなければ、従来法にフォールバック。
+    if not np.isfinite(best_score) or best_score == -np.inf:
+        candidate = y[start:search_end]
+        return (
+            start
+            + int(
+                np.nanargmax(
+                    candidate
+                )
+            )
+        )
+
+    return int(best_idx)
+
+
+def find_release(
+    wrist_speed,
+    foot_plant_idx,
+    fps=30.0
+):
+
+    """
+    2D動画からの簡易Release推定。
+
+    足接地後の手首速度ピークを基本候補とするが、
+    Foot Plant直後だけに限定せず、0.60秒まで検索する。
+
+    これはボール離脱そのものを直接検出する処理ではない。
+    """
+
+    speed = np.asarray(
+        wrist_speed,
+        dtype=float
+    )
+
+    n = len(speed)
+
+    if n < 3:
+        return max(0, n - 1)
+
+    # 30fpsでも十分な探索幅を確保するため、
+    # Foot Plant後0.05〜0.60秒を候補範囲にする。
+    min_offset = max(
+        1,
+        int(round(0.05 * fps))
+    )
+
+    max_offset = max(
+        min_offset + 2,
+        int(round(0.60 * fps))
+    )
+
+    start = min(
+        foot_plant_idx + min_offset,
+        n - 2
+    )
+
+    end = min(
+        foot_plant_idx + max_offset,
+        n - 1
+    )
+
+    if end <= start:
+        return min(
+            max(foot_plant_idx + 1, 0),
+            n - 1
+        )
+
+    # 少しだけ平滑化して、単発のMediaPipeノイズによる
+    # 1フレームピークを抑える。
+    search_speed = moving_average(
+        speed,
+        window=5
+    )
+
+    segment = search_speed[
+        start:
+        end + 1
+    ]
+
+    if not np.any(
+        np.isfinite(segment)
+    ):
+        return start
+
+    # 局所最大を候補にする。
+    candidates = []
+
+    for i in range(
+        start + 1,
+        end
+    ):
+
+        current = search_speed[i]
+        prev_v = search_speed[i - 1]
+        next_v = search_speed[i + 1]
+
+        if not (
+            np.isfinite(current)
+            and np.isfinite(prev_v)
+            and np.isfinite(next_v)
+        ):
+            continue
+
+        if (
+            current >= prev_v
+            and current >= next_v
+        ):
+            # ピーク後の減速量を評価。
+            post_end = min(
+                end + 1,
+                i + max(
+                    2,
+                    int(round(0.10 * fps))
+                )
+            )
+
+            post = search_speed[
+                i + 1:
+                post_end
+            ]
+
+            post_valid = post[
+                np.isfinite(post)
+            ]
+
+            post_drop = (
+                max(
+                    current -
+                    float(np.nanmin(post_valid)),
+                    0.0
+                )
+                if len(post_valid) > 0
+                else 0.0
+            )
+
+            candidates.append(
+                (
+                    i,
+                    float(current),
+                    float(post_drop)
+                )
+            )
+
+    if candidates:
+
+        # 速度を第一優先、ピーク後の減速を第二優先。
+        release_idx = max(
+            candidates,
+            key=lambda x: (
+                x[1],
+                x[2]
+            )
+        )[0]
+
+        return int(release_idx)
+
+    # 局所最大がなければ単純最大値へ。
+    return int(
+        start
+        + np.nanargmax(
+            segment
+        )
+    )
+
+
+def cumulative_scaled_position(
+    points,
+    scale_per_frame,
+    axis
+):
+
+    """
+    ピクセルのフレーム間変位を、
+    各フレームの股関節幅キャリブレーションでm換算し、
+    累積位置を作る。
+
+    単一カメラ2Dなので、透視投影による奥行き誤差は残る。
+    """
+
+    arr = np.asarray(
+        points,
+        dtype=float
+    )
+
+    scales = np.asarray(
+        scale_per_frame,
+        dtype=float
+    )
+
+    n = len(arr)
+
+    if n == 0:
+        return np.asarray([], dtype=float)
+
+    if len(scales) != n:
+        fallback = calculate_scale(
+            scales
+        )
+        scales = np.full(
+            n,
+            fallback,
+            dtype=float
+        )
+
+    fallback = calculate_scale(
+        scales
+    )
+
+    scales = (
+        pd.Series(scales)
+        .replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+        .interpolate(
+            limit_direction="both"
+        )
+        .fillna(
+            fallback
+        )
+        .to_numpy()
+    )
+
+    position = np.zeros(
+        n,
+        dtype=float
+    )
+
+    if n == 1:
+        return position
+
+    delta_px = np.diff(
+        arr[:, axis]
+    )
+
+    pair_scale = (
+        scales[:-1] +
+        scales[1:]
+    ) / 2.0
+
+    delta_m = (
+        delta_px *
+        pair_scale
+    )
+
+    delta_m[
+        ~np.isfinite(delta_m)
+    ] = 0.0
+
+    position[1:] = np.cumsum(
+        delta_m
+    )
+
+    return position
+
+
+def velocity_from_position(
+    position,
+    dt,
+    smooth_window=5
+):
+
+    velocity = np.gradient(
+        position,
+        dt
+    )
+
+    return moving_average(
+        velocity,
+        smooth_window
     )
 
 
@@ -499,6 +903,16 @@ if uploaded_file is not None:
         f"解析FPS: {fps:.2f}"
     )
 
+    if video_fps_mode != "動画のFPSを使用" and abs(
+        fps - orig_fps
+    ) > 0.5:
+
+        st.warning(
+            "手動で指定した解析FPSと動画の元FPSが異なります。"
+            "動画ファイルの実FPSと同じ値を選ばないと、"
+            "速度・加速度・イベント時刻のスケールがずれます。"
+        )
+
 
     # =====================================================
     # Landmark Index
@@ -578,6 +992,7 @@ if uploaded_file is not None:
     lead_ankles = []
 
     scales = []
+    scale_per_frame = []
 
 
     # =====================================================
@@ -827,9 +1242,23 @@ if uploaded_file is not None:
 
                 if hip_width_px > 5:
 
-                    scales.append(
+                    frame_scale = (
                         reference_width_m /
                         hip_width_px
+                    )
+
+                    scales.append(
+                        frame_scale
+                    )
+
+                    scale_per_frame.append(
+                        frame_scale
+                    )
+
+                else:
+
+                    scale_per_frame.append(
+                        np.nan
                     )
 
 
@@ -921,6 +1350,10 @@ if uploaded_file is not None:
 
                 lead_ankles.append(
                     la
+                )
+
+                scale_per_frame.append(
+                    np.nan
                 )
 
 
@@ -1022,6 +1455,41 @@ if uploaded_file is not None:
         scales
     )
 
+    scale_per_frame = np.asarray(
+        scale_per_frame,
+        dtype=float
+    )
+
+    if len(scale_per_frame) != num_frames:
+        scale_per_frame = np.full(
+            num_frames,
+            scale,
+            dtype=float
+        )
+
+    scale_per_frame = (
+        pd.Series(
+            scale_per_frame
+        )
+        .replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+        .interpolate(
+            limit_direction="both"
+        )
+        .fillna(
+            scale
+        )
+        .rolling(
+            window=max(3, smooth_window),
+            center=True,
+            min_periods=1
+        )
+        .mean()
+        .to_numpy()
+    )
+
     dt = 1.0 / fps
 
 
@@ -1045,14 +1513,16 @@ if uploaded_file is not None:
     # Pelvis / Thorax Translation
     # =====================================================
 
-    pelvis_x_m = (
-        pelvis_centers[:, 0] *
-        scale
+    pelvis_x_m = cumulative_scaled_position(
+        pelvis_centers,
+        scale_per_frame,
+        axis=0
     )
 
-    thorax_x_m = (
-        thorax_centers[:, 0] *
-        scale
+    thorax_x_m = cumulative_scaled_position(
+        thorax_centers,
+        scale_per_frame,
+        axis=0
     )
 
 
@@ -1067,20 +1537,16 @@ if uploaded_file is not None:
     )
 
 
-    pelvis_velocity = moving_average(
-        velocity_1d(
-            pelvis_translation,
-            dt
-        ),
+    pelvis_velocity = velocity_from_position(
+        pelvis_translation,
+        dt,
         smooth_window
     )
 
 
-    thorax_velocity = moving_average(
-        velocity_1d(
-            thorax_translation,
-            dt
-        ),
+    thorax_velocity = velocity_from_position(
+        thorax_translation,
+        dt,
         smooth_window
     )
 
@@ -1153,13 +1619,21 @@ if uploaded_file is not None:
     # Separation
     # =====================================================
 
-    trunk_separation = (
-        thorax_angles -
-        pelvis_angles
-    )
-
-    trunk_separation = unwrap_angle_deg(
-        trunk_separation
+    trunk_separation = np.degrees(
+        np.arctan2(
+            np.sin(
+                np.radians(
+                    thorax_angles -
+                    pelvis_angles
+                )
+            ),
+            np.cos(
+                np.radians(
+                    thorax_angles -
+                    pelvis_angles
+                )
+            )
+        )
     )
 
 
@@ -1168,7 +1642,8 @@ if uploaded_file is not None:
     # =====================================================
 
     foot_plant_idx = find_foot_plant(
-        lead_ankles
+        lead_ankles,
+        fps=fps
     )
 
 
@@ -1176,25 +1651,29 @@ if uploaded_file is not None:
     # Wrist Velocity
     # =====================================================
 
-    wrist_x_m = (
-        throwing_wrists[:, 0] *
-        scale
+    wrist_x_m = cumulative_scaled_position(
+        throwing_wrists,
+        scale_per_frame,
+        axis=0
     )
 
-    wrist_y_m = (
-        throwing_wrists[:, 1] *
-        scale
+    wrist_y_m = cumulative_scaled_position(
+        throwing_wrists,
+        scale_per_frame,
+        axis=1
     )
 
 
-    wrist_vx = velocity_1d(
+    wrist_vx = velocity_from_position(
         wrist_x_m,
-        dt
+        dt,
+        smooth_window
     )
 
-    wrist_vy = velocity_1d(
+    wrist_vy = velocity_from_position(
         wrist_y_m,
-        dt
+        dt,
+        smooth_window
     )
 
 
@@ -1211,33 +1690,11 @@ if uploaded_file is not None:
     # Release
     # =====================================================
 
-    release_start = min(
-        foot_plant_idx + 1,
-        num_frames - 1
+    release_idx = find_release(
+        wrist_speed,
+        foot_plant_idx,
+        fps=fps
     )
-
-
-    release_values = wrist_speed[
-        release_start:
-    ]
-
-
-    if len(release_values) > 0:
-
-        release_idx = (
-            release_start +
-            int(
-                np.nanargmax(
-                    release_values
-                )
-            )
-        )
-
-    else:
-
-        release_idx = (
-            num_frames - 1
-        )
 
 
     # =====================================================
@@ -1271,13 +1728,18 @@ if uploaded_file is not None:
         num_frames - 1
     )
 
-    mer_end = min(
-        max(
-            release_idx,
-            mer_start + 1
-        ),
-        num_frames - 1
-    )
+    # 真の肩関節MERではなく、2D肘角度の最大値を
+    # 「MER Proxy」として扱う。Release以前の範囲を優先する。
+    if release_idx > mer_start + 1:
+        mer_end = release_idx - 1
+    else:
+        mer_end = min(
+            mer_start + max(
+                1,
+                int(round(0.20 * fps))
+            ),
+            num_frames - 1
+        )
 
 
     mer_values = elbow_angles[
@@ -1327,9 +1789,25 @@ if uploaded_file is not None:
     )
 
 
+    step_scale = (
+        scale_per_frame[
+            foot_plant_idx
+        ]
+        if (
+            len(scale_per_frame)
+            > foot_plant_idx
+            and np.isfinite(
+                scale_per_frame[
+                    foot_plant_idx
+                ]
+            )
+        )
+        else scale
+    )
+
     step_width_m = (
         step_width_px *
-        scale
+        step_scale
     )
 
 
@@ -1337,15 +1815,17 @@ if uploaded_file is not None:
     # Pseudo GRF
     # =====================================================
 
-    pelvis_y_m = (
-        pelvis_centers[:, 1] *
-        scale
+    pelvis_y_m = cumulative_scaled_position(
+        pelvis_centers,
+        scale_per_frame,
+        axis=1
     )
 
 
-    pelvis_vy = velocity_1d(
+    pelvis_vy = velocity_from_position(
         pelvis_y_m,
-        dt
+        dt,
+        smooth_window
     )
 
 
@@ -2016,7 +2496,7 @@ if uploaded_file is not None:
 
 
     c5.metric(
-        "MER 2D Proxy",
+        "MER Proxy（肘角度）",
         f"{mer_angle:.1f}°"
     )
 
@@ -2068,6 +2548,19 @@ if uploaded_file is not None:
         f"{times[release_idx]:.3f} s"
     )
 
+    fp_to_release_s = max(
+        0.0,
+        (
+            times[release_idx]
+            - times[foot_plant_idx]
+        )
+    )
+
+    st.caption(
+        f"Foot Plant → Release: {fp_to_release_s * 1000:.0f} ms "
+        "（30fpsでは1フレーム=約33ms）"
+    )
+
 
     # =====================================================
     # 注意
@@ -2076,7 +2569,8 @@ if uploaded_file is not None:
     st.warning(
         "2D動画解析による推定値です。"
         "骨盤・胸郭回旋速度は画像面内の角速度、"
-        "MERは肘角度を用いた2D Proxy、"
+        "MER Proxyは2D肘角度の最大値を使った近似で、真の肩関節MERではありません。"
+        "ReleaseはFoot Plant後の手首速度ピークからの推定、"
         "GRFは骨盤鉛直加速度から算出したPseudo GRFです。"
     )
 
@@ -2144,7 +2638,7 @@ if uploaded_file is not None:
             mer_idx
         ],
         line_dash="dash",
-        annotation_text="MER"
+        annotation_text="MER Proxy"
     )
 
 
@@ -2217,7 +2711,7 @@ if uploaded_file is not None:
             mer_idx
         ],
         line_dash="dash",
-        annotation_text="MER"
+        annotation_text="MER Proxy"
     )
 
 
@@ -2280,7 +2774,7 @@ if uploaded_file is not None:
             mer_idx
         ],
         line_dash="dash",
-        annotation_text="MER"
+        annotation_text="MER Proxy"
     )
 
 
@@ -2333,9 +2827,9 @@ if uploaded_file is not None:
                 ]
             ],
             mode="markers+text",
-            text=["MER"],
+            text=["MER Proxy"],
             textposition="top center",
-            name="MER"
+            name="MER Proxy"
         )
     )
 
