@@ -195,12 +195,14 @@ def frame_image(video_path, frame_index):
 
 @st.cache_data(show_spinner=False, max_entries=1)
 def extract_pose_arrays(video_bytes: bytes, suffix: str):
-    """Run MediaPipe once and cache only compact landmark arrays, never the video frames."""
+    """Extract selected points plus every MediaPipe Pose landmark, frame by frame."""
     path = write_temp_video(video_bytes, suffix)
+    cap = None
     try:
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             raise RuntimeError("動画を開けませんでした。別のMP4/MOV形式を試してください。")
+
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         if not np.isfinite(fps) or fps <= 0:
             fps = 30.0
@@ -208,16 +210,25 @@ def extract_pose_arrays(video_bytes: bytes, suffix: str):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         declared_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        keys = [
-            "left_hip", "right_hip", "left_shoulder", "right_shoulder",
-            "throwing_shoulder", "throwing_elbow", "throwing_wrist",
-            "pivot_ankle", "lead_ankle",
-        ]
-        collected = {key: [] for key in keys}
+        landmark_defs = list(mp_pose.PoseLandmark)
+        landmark_names = [item.name for item in landmark_defs]
+        n_landmarks = len(landmark_names)
+
+        # Per frame: normalized x/y/z + visibility/presence; pixel x/y; and
+        # MediaPipe's model-estimated world landmarks. Missing detections remain NaN.
+        norm_frames = []
+        pixel_frames = []
+        world_frames = []
         detected = 0
         frame_count = 0
-        # Downscale pose input to reduce compute and memory, coordinates remain normalized.
         process_width = 960
+
+        def safe_float(obj, attr):
+            value = getattr(obj, attr, None)
+            try:
+                return float(value) if value is not None else np.nan
+            except (TypeError, ValueError):
+                return np.nan
 
         with mp_pose.Pose(
             static_image_mode=False,
@@ -233,51 +244,74 @@ def extract_pose_arrays(video_bytes: bytes, suffix: str):
                 h0, w0 = frame.shape[:2]
                 if w0 > process_width:
                     factor = process_width / w0
-                    process_frame = cv2.resize(frame, (int(w0 * factor), int(h0 * factor)), interpolation=cv2.INTER_AREA)
+                    process_frame = cv2.resize(
+                        frame,
+                        (int(w0 * factor), int(h0 * factor)),
+                        interpolation=cv2.INTER_AREA,
+                    )
                 else:
                     process_frame = frame
-                results = pose.process(cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB))
 
-                row = {key: (np.nan, np.nan) for key in keys}
+                results = pose.process(cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB))
+                norm = np.full((n_landmarks, 5), np.nan, dtype=np.float32)
+                pixel = np.full((n_landmarks, 2), np.nan, dtype=np.float32)
+                world = np.full((n_landmarks, 5), np.nan, dtype=np.float32)
+
                 if results.pose_landmarks:
                     detected += 1
                     lm = results.pose_landmarks.landmark
-                    def xy(landmark):
-                        # Normalized landmark coordinates scaled to original frame dimensions.
-                        return (float(landmark.x * width), float(landmark.y * height))
-                    row["left_hip"] = xy(lm[mp_pose.PoseLandmark.LEFT_HIP])
-                    row["right_hip"] = xy(lm[mp_pose.PoseLandmark.RIGHT_HIP])
-                    row["left_shoulder"] = xy(lm[mp_pose.PoseLandmark.LEFT_SHOULDER])
-                    row["right_shoulder"] = xy(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER])
-                    # Default throwing side is supplied in the UI after extraction; both arms are cached below.
-                    row["throwing_shoulder"] = xy(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER])
-                    row["throwing_elbow"] = xy(lm[mp_pose.PoseLandmark.RIGHT_ELBOW])
-                    row["throwing_wrist"] = xy(lm[mp_pose.PoseLandmark.RIGHT_WRIST])
-                    row["pivot_ankle"] = xy(lm[mp_pose.PoseLandmark.RIGHT_ANKLE])
-                    row["lead_ankle"] = xy(lm[mp_pose.PoseLandmark.LEFT_ANKLE])
-                    # Cache left arm/legs too, enabling left-handed selection without rerunning MediaPipe.
-                    row["left_shoulder_throw"] = xy(lm[mp_pose.PoseLandmark.LEFT_SHOULDER])
-                    row["left_elbow_throw"] = xy(lm[mp_pose.PoseLandmark.LEFT_ELBOW])
-                    row["left_wrist_throw"] = xy(lm[mp_pose.PoseLandmark.LEFT_WRIST])
-                    row["left_ankle_pivot"] = xy(lm[mp_pose.PoseLandmark.LEFT_ANKLE])
-                    row["right_ankle_lead"] = xy(lm[mp_pose.PoseLandmark.RIGHT_ANKLE])
-                for key in keys:
-                    collected[key].append(row[key])
-                # Extra coordinates for left-handed selection.
-                if "left_shoulder_throw" not in collected:
-                    collected["left_shoulder_throw"] = []
-                    collected["left_elbow_throw"] = []
-                    collected["left_wrist_throw"] = []
-                    collected["left_ankle_pivot"] = []
-                    collected["right_ankle_lead"] = []
-                for key in ["left_shoulder_throw", "left_elbow_throw", "left_wrist_throw", "left_ankle_pivot", "right_ankle_lead"]:
-                    collected[key].append(row.get(key, (np.nan, np.nan)))
+                    for li, point in enumerate(lm):
+                        x = safe_float(point, "x")
+                        y = safe_float(point, "y")
+                        z = safe_float(point, "z")
+                        vis = safe_float(point, "visibility")
+                        pres = safe_float(point, "presence")
+                        norm[li] = (x, y, z, vis, pres)
+                        pixel[li] = (x * width, y * height)
+
+                    if results.pose_world_landmarks:
+                        for li, point in enumerate(results.pose_world_landmarks.landmark):
+                            world[li] = (
+                                safe_float(point, "x"),
+                                safe_float(point, "y"),
+                                safe_float(point, "z"),
+                                safe_float(point, "visibility"),
+                                safe_float(point, "presence"),
+                            )
+
+                norm_frames.append(norm)
+                pixel_frames.append(pixel)
+                world_frames.append(world)
                 frame_count += 1
 
-        cap.release()
         if frame_count == 0:
             raise RuntimeError("動画からフレームを読み込めませんでした。")
-        arrays = {key: interpolate_points(np.asarray(val, dtype=float)) for key, val in collected.items()}
+
+        landmark_norm = np.asarray(norm_frames, dtype=np.float32)
+        landmark_px = np.asarray(pixel_frames, dtype=np.float32)
+        landmark_world = np.asarray(world_frames, dtype=np.float32)
+        index = {name: i for i, name in enumerate(landmark_names)}
+
+        def points(name):
+            return interpolate_points(landmark_px[:, index[name], :].astype(float))
+
+        arrays = {
+            "left_hip": points("LEFT_HIP"),
+            "right_hip": points("RIGHT_HIP"),
+            "left_shoulder": points("LEFT_SHOULDER"),
+            "right_shoulder": points("RIGHT_SHOULDER"),
+            "throwing_shoulder": points("RIGHT_SHOULDER"),
+            "throwing_elbow": points("RIGHT_ELBOW"),
+            "throwing_wrist": points("RIGHT_WRIST"),
+            "pivot_ankle": points("RIGHT_ANKLE"),
+            "lead_ankle": points("LEFT_ANKLE"),
+            "left_shoulder_throw": points("LEFT_SHOULDER"),
+            "left_elbow_throw": points("LEFT_ELBOW"),
+            "left_wrist_throw": points("LEFT_WRIST"),
+            "left_ankle_pivot": points("LEFT_ANKLE"),
+            "right_ankle_lead": points("RIGHT_ANKLE"),
+        }
+
         return {
             "fps": fps,
             "width": width,
@@ -286,8 +320,14 @@ def extract_pose_arrays(video_bytes: bytes, suffix: str):
             "frame_count": frame_count,
             "detected_ratio": detected / max(frame_count, 1),
             "arrays": arrays,
+            "landmark_names": landmark_names,
+            "landmark_norm": landmark_norm,
+            "landmark_px": landmark_px,
+            "landmark_world": landmark_world,
         }
     finally:
+        if cap is not None:
+            cap.release()
         try:
             os.unlink(path)
         except OSError:
@@ -351,6 +391,10 @@ playback_duration = num_frames / max(orig_fps, 1e-9)
 analysis_duration = num_frames / max(analysis_fps, 1e-9)
 
 a = data["arrays"]
+landmark_names = data["landmark_names"]
+landmark_norm = data["landmark_norm"]
+landmark_px = data["landmark_px"]
+landmark_world = data["landmark_world"]
 left_hips = a["left_hip"]
 right_hips = a["right_hip"]
 left_shoulders = a["left_shoulder"]
@@ -553,6 +597,32 @@ with st.spinner("注釈付き動画を生成しています..."):
             else:
                 draw = frame
 
+            # Draw all visible MediaPipe Pose skeleton connections first. Coordinates
+            # are raw per-frame detections; selected analysis points are drawn on top.
+            lm_this = landmark_norm[i]
+            px_this = landmark_px[i]
+            pose_connections = getattr(st.session_state, "_pose_connections", None)
+            if pose_connections is None:
+                pose_connections = [(int(a), int(b)) for a, b in mp_pose.POSE_CONNECTIONS]
+                st.session_state["_pose_connections"] = pose_connections
+            skeleton_thickness = max(1, int(round(2 * render_scale)))
+            point_radius = max(1, int(round(2 * render_scale)))
+            visible_points = {}
+            for start_idx, end_idx in pose_connections:
+                if start_idx >= len(lm_this) or end_idx >= len(lm_this):
+                    continue
+                v1, v2 = lm_this[start_idx, 3], lm_this[end_idx, 3]
+                p1, p2 = px_this[start_idx], px_this[end_idx]
+                if (np.isfinite([v1, v2]).all() and v1 >= 0.35 and v2 >= 0.35
+                        and np.isfinite(p1).all() and np.isfinite(p2).all()):
+                    q1 = (int(round(p1[0] * sx)), int(round(p1[1] * sy)))
+                    q2 = (int(round(p2[0] * sx)), int(round(p2[1] * sy)))
+                    cv2.line(draw, q1, q2, (220, 220, 220), skeleton_thickness, cv2.LINE_AA)
+                    visible_points[start_idx] = q1
+                    visible_points[end_idx] = q2
+            for joint_idx, joint_pt in visible_points.items():
+                cv2.circle(draw, joint_pt, point_radius, (255, 80, 200), -1, cv2.LINE_AA)
+
             def pt(point):
                 return (int(round(point[0] * sx)), int(round(point[1] * sy)))
 
@@ -692,12 +762,56 @@ df = pd.DataFrame({
     "MER_Reference_Selected": np.arange(num_frames) == mer_idx,
     "Release_Selected": np.arange(num_frames) == release_idx,
 })
-st.subheader("📥 解析データ")
-st.download_button(
-    "CSVをダウンロード",
-    data=df.to_csv(index=False).encode("utf-8-sig"),
-    file_name="pitching_2d_analysis.csv",
-    mime="text/csv",
+st.subheader("📥 解析データ・骨格データ")
+left_dl, right_dl = st.columns(2)
+with left_dl:
+    st.download_button(
+        "解析指標CSVをダウンロード",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="pitching_2d_analysis.csv",
+        mime="text/csv",
+        key=f"analysis_csv_{video_hash}",
+    )
+
+# Wide format: one row per video frame; one group of columns per each of 33 landmarks.
+# Raw landmarks remain NaN when undetected; no interpolated values are substituted here.
+skeleton_data = {
+    "Frame": np.arange(num_frames, dtype=int),
+    "Playback_Time_s": times_playback,
+    "Estimated_Action_Time_s": times_action,
+    "Pose_Detected": np.isfinite(landmark_norm[:, :, 0]).any(axis=1),
+}
+for joint_idx, joint_name in enumerate(landmark_names):
+    normalized = landmark_norm[:, joint_idx, :]
+    pixel = landmark_px[:, joint_idx, :]
+    world = landmark_world[:, joint_idx, :]
+    prefix = f"{joint_name}"
+    skeleton_data[f"{prefix}_x_norm"] = normalized[:, 0]
+    skeleton_data[f"{prefix}_y_norm"] = normalized[:, 1]
+    skeleton_data[f"{prefix}_z_relative_norm"] = normalized[:, 2]
+    skeleton_data[f"{prefix}_x_pixel"] = pixel[:, 0]
+    skeleton_data[f"{prefix}_y_pixel"] = pixel[:, 1]
+    skeleton_data[f"{prefix}_visibility"] = normalized[:, 3]
+    skeleton_data[f"{prefix}_presence"] = normalized[:, 4]
+    skeleton_data[f"{prefix}_world_x_m_model_estimate"] = world[:, 0]
+    skeleton_data[f"{prefix}_world_y_m_model_estimate"] = world[:, 1]
+    skeleton_data[f"{prefix}_world_z_m_model_estimate"] = world[:, 2]
+    skeleton_data[f"{prefix}_world_visibility"] = world[:, 3]
+    skeleton_data[f"{prefix}_world_presence"] = world[:, 4]
+
+skeleton_df = pd.DataFrame(skeleton_data)
+with right_dl:
+    st.download_button(
+        "全33点の骨格座標CSVをダウンロード",
+        data=skeleton_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="pose_landmarks_all_frames.csv",
+        mime="text/csv",
+        key=f"skeleton_csv_{video_hash}",
+    )
+st.caption(
+    "骨格CSVは1行＝1フレームです。x/y_normは画像内の正規化座標、x/y_pixelは画素座標、z_relative_normはMediaPipeの相対深度です。 "
+    "world_*_m_model_estimateはMediaPipeが推定したワールド座標で、モーションキャプチャによる実測3D座標ではありません。 "
+    "検出できなかった関節は空欄（NaN）です。"
 )
 st.caption("本アプリの値は同一動画・同一撮影条件の動作比較向けです。Next Baseの3D計測レポートの値と数値を直接比較しないでください。")
 
