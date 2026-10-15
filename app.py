@@ -1,6 +1,9 @@
 import gc
 import hashlib
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import subprocess
 import tempfile
 from pathlib import Path
@@ -12,6 +15,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# Keep OpenCV thread usage modest on 512 MB instances.
+cv2.setNumThreads(1)
 
 st.set_page_config(
     page_title="Pitching 2D Motion Review",
@@ -193,7 +198,6 @@ def frame_image(video_path, frame_index):
         cap.release()
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
 def extract_pose_arrays(video_bytes: bytes, suffix: str):
     """Extract selected points plus every MediaPipe Pose landmark, frame by frame."""
     path = write_temp_video(video_bytes, suffix)
@@ -221,7 +225,7 @@ def extract_pose_arrays(video_bytes: bytes, suffix: str):
         world_frames = []
         detected = 0
         frame_count = 0
-        process_width = 960
+        process_width = 640
 
         def safe_float(obj, attr):
             value = getattr(obj, attr, None)
@@ -232,7 +236,7 @@ def extract_pose_arrays(video_bytes: bytes, suffix: str):
 
         with mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=1,
+            model_complexity=0,
             smooth_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -338,7 +342,7 @@ def extract_pose_arrays(video_bytes: bytes, suffix: str):
 # UI
 # ---------------------------------------------------------
 st.title("⚾ ピッチング動作・2D映像解析")
-st.caption("映像から観察できる投影上の動きに限定した解析です。3Dバイオメカニクス測定の代替ではありません。")
+st.caption("省メモリ設定：MediaPipe Lite（model_complexity=0）、推論幅640px、注釈動画は任意生成。映像から観察できる投影上の動きに限定した解析です。")
 st.sidebar.header("⚙️ 解析設定")
 
 dominant_hand = st.sidebar.radio("投手タイプ", ["右投げ", "左投げ"])
@@ -361,6 +365,11 @@ fps_map = {
 }
 smoothing_ms = st.sidebar.slider("平滑化時間 (ms)", 10, 80, 30, step=5, help="固定フレーム数ではなく、時間幅で平滑化します。")
 show_wrist_trail = st.sidebar.checkbox("投球腕の手首軌道を表示", value=True)
+render_annotated_video = st.sidebar.checkbox(
+    "注釈付き解析動画を生成（メモリ負荷が増えます）",
+    value=False,
+    help="Render Freeは512MB RAMのため、まずOFFで解析・骨格CSVを確認してください。必要な場合だけONにします。",
+)
 
 uploaded = st.file_uploader("投球動画をアップロードしてください", type=["mp4", "mov", "avi"])
 
@@ -373,12 +382,29 @@ if uploaded is None:
     st.stop()
 
 video_bytes = uploaded.getvalue()
+if len(video_bytes) > 60 * 1024 * 1024:
+    st.error("無料インスタンスのメモリ保護のため、動画サイズは60MB以下にしてください。必要なら短く切り出すか解像度を下げてください。")
+    st.stop()
 suffix = Path(uploaded.name).suffix or ".mp4"
 video_hash = hashlib.sha1(video_bytes).hexdigest()[:12]
 
+# Keep only one analysis result in session state instead of Streamlit's serialized
+# cache. This avoids an additional cache copy of all-frame landmark arrays.
 try:
-    with st.spinner("MediaPipeで関節位置を抽出しています（同じ動画の再調整時はキャッシュを使います）..."):
-        data = extract_pose_arrays(video_bytes, suffix)
+    if (
+        st.session_state.get("pose_cache_hash") == video_hash
+        and "pose_cache_data" in st.session_state
+    ):
+        data = st.session_state["pose_cache_data"]
+    else:
+        st.session_state.pop("pose_cache_data", None)
+        st.session_state.pop("pose_cache_hash", None)
+        gc.collect()
+        with st.spinner("MediaPipe軽量モデルで全33関節を抽出しています..."):
+            data = extract_pose_arrays(video_bytes, suffix)
+        st.session_state["pose_cache_data"] = data
+        st.session_state["pose_cache_hash"] = video_hash
+        gc.collect()
 except Exception as exc:
     st.error(f"動画解析を開始できませんでした: {exc}")
     st.stop()
@@ -551,151 +577,167 @@ events_df = pd.DataFrame([
     {"イベント": label, "フレーム": int(idx), "動画上の時刻(s)": float(times_playback[idx]), "推定実動作時刻(s)": float(times_action[idx])}
     for label, idx in [("FC", fc_idx), ("MER目視参考", mer_idx), ("Release", release_idx)]
 ])
-st.dataframe(events_df, use_container_width=True, hide_index=True)
+
+# Avoid st.dataframe here: it invokes Streamlit's Arrow serializer, which can
+# stop script execution before the plots render if PyArrow/NumPy versions clash.
+# Plain Markdown keeps the event table visible without Arrow serialization.
+event_table_md = (
+    "| イベント | フレーム | 動画上の時刻 (s) | 推定実動作時刻 (s) |\n"
+    "|---|---:|---:|---:|\n"
+    + "\n".join(
+        f"| {row['イベント']} | {row['フレーム']} | {row['動画上の時刻(s)']:.3f} | {row['推定実動作時刻(s)']:.3f} |"
+        for _, row in events_df.iterrows()
+    )
+)
+st.markdown(event_table_md)
 
 st.warning(
     "このアプリは単眼2D映像の投影値です。股関節幅で正規化した速度・ステップ幅は、m/s・mの実測値ではありません。\n\n"
     "Next Baseレポートにある重心速度（m/s）、真の肩関節MER、床反力、セグメントエネルギー、関節トルク、エネルギー伝達効率は、3D座標・身体パラメータ・力学計測などがないため、この動画から正確には再現できません。GRFやトルクを推定値として表示することもしません。"
 )
 
-# ---------------------------------------------------------
-# Annotated H.264 video, streamed to ffmpeg without storing frames in RAM.
-# ---------------------------------------------------------
-st.subheader("② 解析動画")
-with st.spinner("注釈付き動画を生成しています..."):
-    input_path = write_temp_video(video_bytes, suffix)
-    render_cap = cv2.VideoCapture(input_path)
-    render_max_width = 960
-    render_scale = min(1.0, render_max_width / max(width, 1))
-    render_width = max(2, int(round(width * render_scale)))
-    render_height = max(2, int(round(height * render_scale)))
-    sx = render_width / max(width, 1)
-    sy = render_height / max(height, 1)
-    out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_analysis.mp4").name
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{render_width}x{render_height}", "-r", f"{orig_fps:.6f}", "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path,
-    ]
-    proc = None
-    wrist_trail = []
-    max_trail = 45
-    render_progress = st.progress(0)
-    processed = 0
-    try:
-        if not render_cap.isOpened():
-            raise RuntimeError("動画を描画用に再度開けませんでした。")
-        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        for i in range(num_frames):
-            ok, frame = render_cap.read()
-            if not ok:
-                break
-            if render_scale < 0.999999:
-                draw = cv2.resize(frame, (render_width, render_height), interpolation=cv2.INTER_AREA)
-            else:
-                draw = frame
-
-            # Draw all visible MediaPipe Pose skeleton connections first. Coordinates
-            # are raw per-frame detections; selected analysis points are drawn on top.
-            lm_this = landmark_norm[i]
-            px_this = landmark_px[i]
-            pose_connections = getattr(st.session_state, "_pose_connections", None)
-            if pose_connections is None:
-                pose_connections = [(int(a), int(b)) for a, b in mp_pose.POSE_CONNECTIONS]
-                st.session_state["_pose_connections"] = pose_connections
-            skeleton_thickness = max(1, int(round(2 * render_scale)))
-            point_radius = max(1, int(round(2 * render_scale)))
-            visible_points = {}
-            for start_idx, end_idx in pose_connections:
-                if start_idx >= len(lm_this) or end_idx >= len(lm_this):
-                    continue
-                v1, v2 = lm_this[start_idx, 3], lm_this[end_idx, 3]
-                p1, p2 = px_this[start_idx], px_this[end_idx]
-                if (np.isfinite([v1, v2]).all() and v1 >= 0.35 and v2 >= 0.35
-                        and np.isfinite(p1).all() and np.isfinite(p2).all()):
-                    q1 = (int(round(p1[0] * sx)), int(round(p1[1] * sy)))
-                    q2 = (int(round(p2[0] * sx)), int(round(p2[1] * sy)))
-                    cv2.line(draw, q1, q2, (220, 220, 220), skeleton_thickness, cv2.LINE_AA)
-                    visible_points[start_idx] = q1
-                    visible_points[end_idx] = q2
-            for joint_idx, joint_pt in visible_points.items():
-                cv2.circle(draw, joint_pt, point_radius, (255, 80, 200), -1, cv2.LINE_AA)
-
-            def pt(point):
-                return (int(round(point[0] * sx)), int(round(point[1] * sy)))
-
-            pelvis_pt = pt(pelvis_centers[i])
-            thorax_pt = pt(thorax_centers[i])
-            sh_pt = pt(throwing_shoulder[i])
-            el_pt = pt(throwing_elbow[i])
-            wr_pt = pt(throwing_wrist[i])
-            pivot_pt = pt(pivot_ankle[i])
-            lead_pt = pt(lead_ankle[i])
-            r = max(4, int(round(7 * render_scale)))
-            lw = max(2, int(round(3 * render_scale)))
-            cv2.circle(draw, pelvis_pt, r, (255, 80, 0), -1)
-            cv2.circle(draw, thorax_pt, r, (0, 220, 70), -1)
-            cv2.line(draw, sh_pt, el_pt, (0, 255, 255), lw)
-            cv2.line(draw, el_pt, wr_pt, (0, 255, 255), lw)
-            cv2.circle(draw, pivot_pt, r, (255, 255, 0), -1)
-            cv2.circle(draw, lead_pt, r, (255, 255, 0), -1)
-            if show_wrist_trail:
-                wrist_trail.append(wr_pt)
-                if len(wrist_trail) > max_trail:
-                    wrist_trail.pop(0)
-                for j in range(1, len(wrist_trail)):
-                    cv2.line(draw, wrist_trail[j - 1], wrist_trail[j], (0, 0, 255), lw)
-            if i == fc_idx:
-                cv2.line(draw, pivot_pt, lead_pt, (255, 0, 255), lw + 1)
-                cv2.putText(draw, "FC (user checked)", (max(8, lead_pt[0] + 5), max(20, lead_pt[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
-            if i == mer_idx:
-                cv2.putText(draw, "MER reference (2D only)", (max(8, wr_pt[0] + 5), max(20, wr_pt[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-            if i == release_idx:
-                cv2.putText(draw, "Release (user checked)", (max(8, wr_pt[0] + 5), min(render_height - 10, wr_pt[1] + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
-            info = [
-                f"Playback time: {times_playback[i]:.3f}s",
-                f"Estimated action time: {times_action[i]:.3f}s",
-                f"Hip-line angle speed: {hip_line_angular_velocity[i]:.0f} deg/s",
-                f"Shoulder-line angle speed: {shoulder_line_angular_velocity[i]:.0f} deg/s",
-                f"Wrist speed: {wrist_speed_hw_s[i]:.2f} hip-width/s",
-            ]
-            for row_idx, text in enumerate(info):
-                cv2.putText(draw, text, (10, 22 + row_idx * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-            if proc.stdin is None:
-                raise BrokenPipeError("ffmpeg stdin is unavailable")
-            proc.stdin.write(memoryview(draw).cast("B"))
-            processed += 1
-            if processed % 10 == 0:
-                render_progress.progress(min(processed / max(num_frames, 1), 1.0))
-
-        # Do NOT close stdin manually before communicate(); communicate manages EOF/wait/stderr.
-        _, stderr_bytes = proc.communicate()
-        rc = proc.returncode
-        if rc != 0:
-            err = stderr_bytes.decode("utf-8", errors="replace") if isinstance(stderr_bytes, bytes) else str(stderr_bytes)
-            raise RuntimeError("ffmpegエンコードに失敗しました: " + (err[-2000:] or "原因不明"))
-    except Exception as exc:
-        if proc is not None:
-            try:
-                if proc.poll() is None:
-                    proc.kill()
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-        st.error(f"解析動画を生成できませんでした: {exc}")
-        st.stop()
-    finally:
-        render_cap.release()
+if render_annotated_video:
+    # ---------------------------------------------------------
+    # Annotated H.264 video, streamed to ffmpeg without storing frames in RAM.
+    # ---------------------------------------------------------
+    st.subheader("② 解析動画")
+    with st.spinner("注釈付き動画を生成しています..."):
+        input_path = write_temp_video(video_bytes, suffix)
+        render_cap = cv2.VideoCapture(input_path)
+        render_max_width = 640
+        render_scale = min(1.0, render_max_width / max(width, 1))
+        render_width = max(2, int(round(width * render_scale)))
+        render_height = max(2, int(round(height * render_scale)))
+        sx = render_width / max(width, 1)
+        sy = render_height / max(height, 1)
+        out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_analysis.mp4").name
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{render_width}x{render_height}", "-r", f"{orig_fps:.6f}", "-i", "-",
+            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path,
+        ]
+        proc = None
+        wrist_trail = []
+        max_trail = 45
+        render_progress = st.progress(0)
+        processed = 0
         try:
-            os.unlink(input_path)
-        except OSError:
-            pass
-    render_progress.progress(1.0)
+            if not render_cap.isOpened():
+                raise RuntimeError("動画を描画用に再度開けませんでした。")
+            proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            for i in range(num_frames):
+                ok, frame = render_cap.read()
+                if not ok:
+                    break
+                if render_scale < 0.999999:
+                    draw = cv2.resize(frame, (render_width, render_height), interpolation=cv2.INTER_AREA)
+                else:
+                    draw = frame
 
-st.video(out_path)
-st.caption("注釈動画はH.264・最大960px幅で出力します。スロー再生上の時刻と推定実動作時刻を分けて表示しています。")
+                # Draw all visible MediaPipe Pose skeleton connections first. Coordinates
+                # are raw per-frame detections; selected analysis points are drawn on top.
+                lm_this = landmark_norm[i]
+                px_this = landmark_px[i]
+                pose_connections = getattr(st.session_state, "_pose_connections", None)
+                if pose_connections is None:
+                    pose_connections = [(int(a), int(b)) for a, b in mp_pose.POSE_CONNECTIONS]
+                    st.session_state["_pose_connections"] = pose_connections
+                skeleton_thickness = max(1, int(round(2 * render_scale)))
+                point_radius = max(1, int(round(2 * render_scale)))
+                visible_points = {}
+                for start_idx, end_idx in pose_connections:
+                    if start_idx >= len(lm_this) or end_idx >= len(lm_this):
+                        continue
+                    v1, v2 = lm_this[start_idx, 3], lm_this[end_idx, 3]
+                    p1, p2 = px_this[start_idx], px_this[end_idx]
+                    if (np.isfinite([v1, v2]).all() and v1 >= 0.35 and v2 >= 0.35
+                            and np.isfinite(p1).all() and np.isfinite(p2).all()):
+                        q1 = (int(round(p1[0] * sx)), int(round(p1[1] * sy)))
+                        q2 = (int(round(p2[0] * sx)), int(round(p2[1] * sy)))
+                        cv2.line(draw, q1, q2, (220, 220, 220), skeleton_thickness, cv2.LINE_AA)
+                        visible_points[start_idx] = q1
+                        visible_points[end_idx] = q2
+                for joint_idx, joint_pt in visible_points.items():
+                    cv2.circle(draw, joint_pt, point_radius, (255, 80, 200), -1, cv2.LINE_AA)
+
+                def pt(point):
+                    return (int(round(point[0] * sx)), int(round(point[1] * sy)))
+
+                pelvis_pt = pt(pelvis_centers[i])
+                thorax_pt = pt(thorax_centers[i])
+                sh_pt = pt(throwing_shoulder[i])
+                el_pt = pt(throwing_elbow[i])
+                wr_pt = pt(throwing_wrist[i])
+                pivot_pt = pt(pivot_ankle[i])
+                lead_pt = pt(lead_ankle[i])
+                r = max(4, int(round(7 * render_scale)))
+                lw = max(2, int(round(3 * render_scale)))
+                cv2.circle(draw, pelvis_pt, r, (255, 80, 0), -1)
+                cv2.circle(draw, thorax_pt, r, (0, 220, 70), -1)
+                cv2.line(draw, sh_pt, el_pt, (0, 255, 255), lw)
+                cv2.line(draw, el_pt, wr_pt, (0, 255, 255), lw)
+                cv2.circle(draw, pivot_pt, r, (255, 255, 0), -1)
+                cv2.circle(draw, lead_pt, r, (255, 255, 0), -1)
+                if show_wrist_trail:
+                    wrist_trail.append(wr_pt)
+                    if len(wrist_trail) > max_trail:
+                        wrist_trail.pop(0)
+                    for j in range(1, len(wrist_trail)):
+                        cv2.line(draw, wrist_trail[j - 1], wrist_trail[j], (0, 0, 255), lw)
+                if i == fc_idx:
+                    cv2.line(draw, pivot_pt, lead_pt, (255, 0, 255), lw + 1)
+                    cv2.putText(draw, "FC (user checked)", (max(8, lead_pt[0] + 5), max(20, lead_pt[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+                if i == mer_idx:
+                    cv2.putText(draw, "MER reference (2D only)", (max(8, wr_pt[0] + 5), max(20, wr_pt[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+                if i == release_idx:
+                    cv2.putText(draw, "Release (user checked)", (max(8, wr_pt[0] + 5), min(render_height - 10, wr_pt[1] + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+                info = [
+                    f"Playback time: {times_playback[i]:.3f}s",
+                    f"Estimated action time: {times_action[i]:.3f}s",
+                    f"Hip-line angle speed: {hip_line_angular_velocity[i]:.0f} deg/s",
+                    f"Shoulder-line angle speed: {shoulder_line_angular_velocity[i]:.0f} deg/s",
+                    f"Wrist speed: {wrist_speed_hw_s[i]:.2f} hip-width/s",
+                ]
+                for row_idx, text in enumerate(info):
+                    cv2.putText(draw, text, (10, 22 + row_idx * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+                if proc.stdin is None:
+                    raise BrokenPipeError("ffmpeg stdin is unavailable")
+                proc.stdin.write(memoryview(draw).cast("B"))
+                processed += 1
+                if processed % 10 == 0:
+                    render_progress.progress(min(processed / max(num_frames, 1), 1.0))
+
+            # Do NOT close stdin manually before communicate(); communicate manages EOF/wait/stderr.
+            _, stderr_bytes = proc.communicate()
+            rc = proc.returncode
+            if rc != 0:
+                err = stderr_bytes.decode("utf-8", errors="replace") if isinstance(stderr_bytes, bytes) else str(stderr_bytes)
+                raise RuntimeError("ffmpegエンコードに失敗しました: " + (err[-2000:] or "原因不明"))
+        except Exception as exc:
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+            st.error(f"解析動画を生成できませんでした: {exc}")
+            st.stop()
+        finally:
+            render_cap.release()
+            try:
+                os.unlink(input_path)
+            except OSError:
+                pass
+        render_progress.progress(1.0)
+
+    st.video(out_path)
+    st.caption("注釈動画はH.264・最大640px幅で出力します。スロー再生上の時刻と推定実動作時刻を分けて表示しています。")
+else:
+    st.subheader("② 解析動画")
+    st.info("注釈付き動画の生成はOFFです。メモリ不足を避けるため、まずは指標と骨格CSVを確認してください。必要な場合は左側でONにして再実行してください。")
 
 # ---------------------------------------------------------
 # Plots
